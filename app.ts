@@ -49,12 +49,64 @@ function createMultisigAccountAddress(creator: Uint8Array, creatorNonce: bigint)
   return createHash('sha3-256').update(combined).digest();
 }
 
+// Benchmark the system's performance
+async function benchmarkPerformance(iterations: number = 1000): Promise<number> {
+  const startTime = Date.now();
+  let count = 0;
+  
+  while (count < iterations) {
+    const privateKey = Ed25519PrivateKey.generate();
+    authKeyBytesVec(privateKey);
+    count++;
+  }
+  
+  const elapsed = (Date.now() - startTime) / 1000; // Convert to seconds
+  const genPerSecond = Math.floor(iterations / elapsed); // Returns generations per second
+  return genPerSecond;
+}
+
+// Format time duration into human readable string
+function formatDuration(seconds: number): string {
+  if (seconds < 0.1) return `~${(seconds * 1000).toFixed(0)} milliseconds`;
+  if (seconds < 60) return `~${Math.ceil(seconds)} seconds`;
+  if (seconds < 3600) return `~${Math.ceil(seconds / 60)} minutes`;
+  if (seconds < 86400) return `~${(seconds / 3600).toFixed(1)} hours`;
+  return `~${(seconds / 86400).toFixed(1)} days`;
+}
+
+// Calculate estimated time based on prefix/suffix length
+async function calculateEstimate(prefix?: string, suffix?: string, threadCount: number = 1): Promise<string> {
+  if (!prefix && !suffix) return 'Should be instant';
+  
+  // Calculate probability based on hex character matches needed
+  const matchNeeded = (prefix?.length || 0) + (suffix?.length || 0);
+  const probabilityPerTry = 1 / (16 ** matchNeeded); // 16 possible hex chars
+  
+  // Estimate attempts needed (95% confidence)
+  const attemptsNeeded = Math.ceil(-Math.log(0.05) / probabilityPerTry);
+  
+  // Benchmark actual system performance
+  const genPerSecondSingleThread = await benchmarkPerformance();
+  const genPerSecondTotal = genPerSecondSingleThread * threadCount;
+  
+  const seconds = attemptsNeeded / genPerSecondTotal;
+  
+  return formatDuration(seconds);
+}
+
 // Worker thread function
 if (!isMainThread) {
   const { prefix, suffix, multisig } = workerData;
+  let localGenCount = 0;
   
   const generateKey = async () => {
     while (true) {
+      localGenCount++;
+      // Send generation count to main thread every 1000 attempts
+      if (localGenCount % 1000 === 0) {
+        parentPort?.postMessage({ type: 'progress', count: 1000 });
+      }
+
       const privateKey = Ed25519PrivateKey.generate();
       const accountAddressBytes = authKeyBytesVec(privateKey);
       const searchBytes = multisig 
@@ -68,6 +120,7 @@ if (!isMainThread) {
       if (suffix && !address.endsWith(suffix)) continue;
 
       parentPort?.postMessage({
+        type: 'result',
         address,
         privateKey: bytesToHex(privateKey.toUint8Array()),
         multisigAddress: multisig ? address : undefined
@@ -84,6 +137,12 @@ async function main() {
   const startTime = Date.now();
   let foundCount = 0;
   let totalGenerated = 0;
+  let lastUpdateTime = Date.now();
+
+  // Show estimate before starting
+  console.log(`Benchmarking system performance...`);
+  console.log(`Estimated time: ${await calculateEstimate(args.prefix, args.suffix, args.threads)}`);
+  console.log('Generating addresses...\n');
 
   // Spawn worker threads
   const workers = Array.from({ length: args.threads }, () => 
@@ -98,22 +157,37 @@ async function main() {
 
   // Handle results from workers
   workers.forEach(worker => {
-    worker.on('message', ({ address, privateKey, multisigAddress }) => {
-      totalGenerated++;
-      foundCount++;
-      
-      if (multisigAddress) {
-        console.log(`Multisig account address: 0x${multisigAddress}`);
-        console.log(`Standard account address: 0x${address}`);
-      } else {
-        console.log(`Standard account address: 0x${address}`);
-      }
-      console.log(`Private key:              0x${privateKey}\n`);
+    worker.on('message', (message) => {
+      if (message.type === 'progress') {
+        totalGenerated += message.count;
+        const currentTime = Date.now();
+        // Update display every second
+        if (currentTime - lastUpdateTime >= 1000) {
+          const elapsedSeconds = (currentTime - startTime) / 1000;
+          const genPerSecond = Math.floor(totalGenerated / elapsedSeconds);
+          process.stdout.write(`\rGenerating... ${genPerSecond.toLocaleString()} addresses per second`);
+          lastUpdateTime = currentTime;
+        }
+      } else if (message.type === 'result') {
+        process.stdout.write('\n'); // Clear the progress line
+        foundCount++;
+        
+        if (message.multisigAddress) {
+          console.log(`Multisig account address: 0x${message.multisigAddress}`);
+          console.log(`Standard account address: 0x${message.address}`);
+        } else {
+          console.log(`Standard account address: 0x${message.address}`);
+        }
+        console.log(`Private key:              0x${message.privateKey}\n`);
 
-      if (foundCount >= args.count) {
-        console.log(`Elapsed time: ${(Date.now() - startTime) / 1000}s`);
-        console.log(`Total addresses generated: ${totalGenerated}`);
-        process.exit(0);
+        if (foundCount >= args.count) {
+          const elapsedSeconds = (Date.now() - startTime) / 1000;
+          const finalGenPerSecond = Math.floor(totalGenerated / elapsedSeconds);
+          console.log(`Final generation rate: ${finalGenPerSecond.toLocaleString()} addresses/second`);
+          console.log(`Elapsed time: ${elapsedSeconds}s`);
+          console.log(`Total addresses generated: ${totalGenerated.toLocaleString()}`);
+          process.exit(0);
+        }
       }
     });
   });
